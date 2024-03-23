@@ -1,16 +1,20 @@
 """
-    DiffJPEG in JAX
+DiffJPEG in JAX
 
-    Based on
-    https://github.com/mlomnitz/DiffJPEG
-    and
-    https://machine-learning-and-security.github.io/papers/mlsec17_paper_54.pdf
+Based on
+- https://github.com/necla-ml/Diff-JPEG
+- https://github.com/mlomnitz/DiffJPEG
+- https://machine-learning-and-security.github.io/papers/mlsec17_paper_54.pdf
 """
+# ruff:noqa: F722
 
+from typing import Tuple
 import jax.numpy as jnp
 import jax
+from jaxtyping import Float, Array
 
-y_table = jnp.array(
+
+Y_TABLE = jnp.array(
     [
         [16, 11, 10, 16, 24, 40, 51, 61],
         [12, 12, 14, 19, 26, 58, 60, 55],
@@ -22,33 +26,33 @@ y_table = jnp.array(
         [72, 92, 95, 98, 112, 100, 103, 99],
     ],
     dtype=jnp.float32,
-).T
+)
 
-c_table = jnp.full((8, 8), 99, dtype=jnp.float32)
-c_table = c_table.at[:4, :4].set(
-    jnp.array(
-        [
-            [17, 18, 24, 47],
-            [18, 21, 26, 66],
-            [24, 26, 56, 99],
-            [47, 66, 99, 99],
-        ]
-    ).T
+C_TABLE = jnp.array(
+    [
+        [17, 18, 24, 47, 99, 99, 99, 99],
+        [18, 21, 26, 66, 99, 99, 99, 99],
+        [24, 26, 56, 99, 99, 99, 99, 99],
+        [47, 66, 99, 99, 99, 99, 99, 99],
+        [99, 99, 99, 99, 99, 99, 99, 99],
+        [99, 99, 99, 99, 99, 99, 99, 99],
+        [99, 99, 99, 99, 99, 99, 99, 99],
+        [99, 99, 99, 99, 99, 99, 99, 99],
+    ],
 )
 
 
-def quality_to_factor(quality: float) -> float:
-    return (
+def quality_to_scale(quality: Float[Array, "1"]) -> Float[Array, "1"]:
+    return jnp.floor(
         jnp.where(
             quality < 50,
             5000.0 / quality,
             200.0 - quality * 2,
         )
-        / 100.0
     )
 
 
-def rgb_to_ycbcr(image: jnp.ndarray) -> jnp.ndarray:
+def rgb_to_ycbcr(image: Float[Array, "H W 3"]) -> Float[Array, "H W 3"]:
     """Converts RGB image to YCbCr. Channels last"""
     matrix = jnp.array(
         [
@@ -65,7 +69,7 @@ def rgb_to_ycbcr(image: jnp.ndarray) -> jnp.ndarray:
     return result.reshape(image.shape)
 
 
-def ycbcr_to_rgb(image: jnp.ndarray) -> jnp.ndarray:
+def ycbcr_to_rgb(image: Float[Array, "H W 3"]) -> Float[Array, "H W 3"]:
     """Converts YCbCr image to RGB. Channels last"""
     matrix = jnp.array(
         [
@@ -80,22 +84,24 @@ def ycbcr_to_rgb(image: jnp.ndarray) -> jnp.ndarray:
     return result
 
 
-def chroma_subsampling(image: jnp.ndarray) -> jnp.ndarray:
+def chroma_subsampling(image: Float[Array, "H W 3"]) -> Float[Array, "H W 3"]:
     """Chroma subsampling on CbCr channels. Channels last"""
     H, W, C = image.shape
 
     y = image[..., 0]
     cb = jax.image.resize(
-        image[..., 1], (H // 2, W // 2), method="linear", antialias=False
+        image[..., 1], (H // 2, W // 2), method="bilinear", antialias=True
     )
     cr = jax.image.resize(
-        image[..., 2], (H // 2, W // 2), method="linear", antialias=False
+        image[..., 2], (H // 2, W // 2), method="bilinear", antialias=True
     )
 
     return y, cb, cr
 
 
-def chroma_upsampling(y: jnp.ndarray, cb: jnp.ndarray, cr: jnp.ndarray) -> jnp.ndarray:
+def chroma_upsampling(
+    y: Float[Array, "H W"], cb: Float[Array, "H W"], cr: Float[Array, "H W"]
+) -> Float[Array, "H W 3"]:
     def repeat(x: jnp.array, k: int = 2):
         H, W = x.shape
         x = x.reshape(1, H, W, 1)
@@ -108,7 +114,7 @@ def chroma_upsampling(y: jnp.ndarray, cb: jnp.ndarray, cr: jnp.ndarray) -> jnp.n
     return jnp.stack([y, cb, cr], axis=-1)
 
 
-def block_splitting(image: jnp.ndarray, k: int = 8) -> jnp.ndarray:
+def block_splitting(image: Float[Array, "H W"], k: int = 8) -> Float[Array, "H W k k"]:
     H, W = image.shape
     image = image.reshape(H // k, k, W // k, k)
     image = jnp.transpose(image, (2, 0, 3, 1))
@@ -116,35 +122,38 @@ def block_splitting(image: jnp.ndarray, k: int = 8) -> jnp.ndarray:
     return image
 
 
-def block_merging(patches: jnp.ndarray, H: int, W: int, k: int = 8) -> jnp.ndarray:
+def block_merging(
+    patches: Float[Array, "H W k k"], H: int, W: int, k: int = 8
+) -> Float[Array, "H W"]:
     patches = patches.reshape(H // k, W // k, k, k)
     patches = patches.transpose((0, 2, 1, 3))
     return patches.reshape(H, W)
 
 
-def y_quantize(image: jnp.ndarray, factor: float = 1.0) -> jnp.ndarray:
-    image = image / (y_table * factor)
-    image = jnp.round(image)
-    return image
+def quantize(
+    image: Float[Array, "H W k k"],
+    table: Float[Array, "k k"],
+    quality: Float[Array, "1"],
+) -> Float[Array, "H W k k"]:
+    table = table * quality_to_scale(quality)
+    table = jnp.clip(jnp.floor((table + 50.0) / 100.0), 1, 255)
+    output = image / table
+    output = jnp.round(output)
+    return output
 
 
-def y_dequantize(image: jnp.ndarray, factor: float = 1.0) -> jnp.ndarray:
-    image = image * (y_table * factor)
-    return image
+def dequantize(
+    image: Float[Array, "H W k k"],
+    table: Float[Array, "k k"],
+    quality: Float[Array, "1"],
+) -> Float[Array, "H W k k"]:
+    table = table * quality_to_scale(quality)
+    # Perform scaling
+    output = image * jnp.clip(jnp.floor((table + 50.0) / 100.0), 1, 255)
+    return output
 
 
-def c_quantize(image: jnp.ndarray, factor: float = 1.0) -> jnp.ndarray:
-    image = image / (c_table * factor)
-    image = jnp.round(image)
-    return image
-
-
-def c_dequantize(image: jnp.ndarray, factor: float = 1.0) -> jnp.ndarray:
-    image = image * (c_table * factor)
-    return image
-
-
-def dct8x8(image: jnp.ndarray) -> jnp.ndarray:
+def dct8x8(image: Float[Array, "H W 8 8"]) -> Float[Array, "H W 8 8"]:
     """Applies DCT on 8x8 blocks. Channels last"""
 
     indices = jnp.arange(8)
@@ -162,7 +171,7 @@ def dct8x8(image: jnp.ndarray) -> jnp.ndarray:
     return result
 
 
-def idct8x8(image: jnp.ndarray) -> jnp.ndarray:
+def idct8x8(image: Float[Array, "H W 8 8"]) -> Float[Array, "H W 8 8"]:
     """Applies IDCT on 8x8 blocks. Channels last"""
 
     indices = jnp.arange(8)
@@ -180,45 +189,54 @@ def idct8x8(image: jnp.ndarray) -> jnp.ndarray:
     return result
 
 
-def compress_jpeg(image: jnp.ndarray, factor: float = 1.0) -> jnp.ndarray:
-    y, cb, cr = chroma_subsampling(rgb_to_ycbcr(image * 255.0))
+def compress_jpeg(
+    image: Float[Array, "H W 3"], quality: Float[Array, "1"]
+) -> Tuple[Float[Array, "H W 8 8"], Float[Array, "H W 8 8"], Float[Array, "H W 8 8"]]:
+    y, cb, cr = chroma_subsampling(rgb_to_ycbcr(image))
 
-    y = y_quantize(dct8x8(block_splitting(y)), factor=factor)
-    cb = c_quantize(dct8x8(block_splitting(cb)), factor=factor)
-    cr = c_quantize(dct8x8(block_splitting(cr)), factor=factor)
+    y = quantize(dct8x8(block_splitting(y)), Y_TABLE, quality=quality)
+    cb = quantize(dct8x8(block_splitting(cb)), C_TABLE, quality=quality)
+    cr = quantize(dct8x8(block_splitting(cr)), C_TABLE, quality=quality)
 
     return y, cb, cr
 
 
 def decompress_jpeg(
-    y: jnp.ndarray,
-    cb: jnp.ndarray,
-    cr: jnp.ndarray,
+    y: Float[Array, "H W 8 8"],
+    cb: Float[Array, "H W 8 8"],
+    cr: Float[Array, "H W 8 8"],
     H: int,
     W: int,
-    factor: float = 1.0,
-) -> jnp.ndarray:
-    y = block_merging(idct8x8(y_dequantize(y, factor=factor)), H, W)
-    cb = block_merging(idct8x8(c_dequantize(cb, factor=factor)), H // 2, W // 2)
-    cr = block_merging(idct8x8(c_dequantize(cr, factor=factor)), H // 2, W // 2)
+    quality: Float[Array, "1"],
+) -> Float[Array, "H W 3"]:
+    y = block_merging(idct8x8(dequantize(y, Y_TABLE, quality=quality)), H, W)
+    cb = block_merging(
+        idct8x8(dequantize(cb, C_TABLE, quality=quality)), H // 2, W // 2
+    )
+    cr = block_merging(
+        idct8x8(dequantize(cr, C_TABLE, quality=quality)), H // 2, W // 2
+    )
 
     image = chroma_upsampling(y, cb, cr)
     image = ycbcr_to_rgb(image)
     image = jnp.clip(image, 0, 255)
-    return image / 255.0
+    return image
 
 
-def diff_jpeg(image: jnp.ndarray, quality: float = 75.0) -> jnp.ndarray:
+def diff_jpeg(
+    image: Float[Array, "H W 3"], quality: Float[Array, "1"]
+) -> Float[Array, "H W 3"]:
     """
-    Applies DiffJPEG compression on an image.
+    Applies DiffJPEG compression on an image. The input should be in [0, 255] range, not [0, 1].
 
     Args:
         image: Image to compress (H, W, C)
-        quality: Quality factor in (0, 100)
+        quality: Quality in (0, 100)
     """
     H, W, _ = image.shape
+    quality = jnp.asarray(quality, dtype=jnp.float32)
 
-    # Pad image to multiple of 16
+    # Pad image to multiple of 16 as we use 8x8 blocks on cb and cr channels which are 2x subsampled
     hpad = 16 - (H % 16)
     wpad = 16 - (W % 16)
 
@@ -229,9 +247,8 @@ def diff_jpeg(image: jnp.ndarray, quality: float = 75.0) -> jnp.ndarray:
         image, ((0, hpad), (0, wpad), (0, 0)), mode="constant", constant_values=0
     )
 
-    factor = quality_to_factor(quality)
-    y, cb, cr = compress_jpeg(image, factor=factor)
+    y, cb, cr = compress_jpeg(image, quality=quality)
 
-    image = decompress_jpeg(y, cb, cr, H=H, W=W, factor=factor)
+    image = decompress_jpeg(y, cb, cr, H=H, W=W, quality=quality)
     image = image[: H - hpad, : W - wpad]
     return image

@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "diffjpeg_jax"
-version = "0.1.0"
+version = "1.0.0"
 description = "DiffJPEG implemented in JAX"
 authors = ["Haydn Jones <haydnjonest@gmail.com>"]
 readme = "README.md"
@@ -8,6 +8,7 @@ packages = [{ include = "diffjpeg_jax" }]
 
 [tool.poetry.dependencies]
 python = "^3.7"
+jaxtyping = "^0.2"
 
 [build-system]
 requires = ["poetry-core"]
